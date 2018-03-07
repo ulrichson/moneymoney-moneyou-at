@@ -1,5 +1,5 @@
 WebBanking {
-  version = 1.00,
+  version = 1.1,
   url = "https://secure.moneyou.at/cwsoft/policyenforcer/pages/loginB2C.jsf",
   services = {"Moneyou Austria"},
   description = string.format(MM.localizeText("Get balance and transactions for %s"), "Moneyou Austria")
@@ -8,6 +8,7 @@ WebBanking {
 local debug = false
 local overviewPage
 local token
+local ignoreSince = false -- ListAccounts sets this to true in order to get all transaction in the past
 
 -- convert German localized amount string to number object
 local function strToAmount(str)
@@ -60,36 +61,49 @@ end
 
 function ListAccounts(knownAccounts)
   local accounts = {}
-  local accountPage
 
-  -- Navigate to "Tagesgeld" and parse accounts
-  accountPage = HTML(connection:get(overviewPage:xpath("//*[@id='categoryValueInList6:0:']"):attr("href")))
-  accountPage:xpath("//*[@id='PrincipalToCashAccountLinkForm:savingAccountList']/tbody/tr"):each(
+  -- Ignore since date when for first import
+  ignoreSince = true
+
+  -- Navigate to "Tagesgeld" / "Festgeld" and parse accounts
+  overviewPage:xpath("//*[@id='clientOverviewAssetForm:depositsList']/tbody/tr"):each(
     function(index, element)
-      local account = {
-        name = element:xpath("td[1]//span"):text(),
-        iban = element:xpath("td[2]//span"):text(),
-        accountNumber = element:xpath("td[2]//span"):text(),
-        currency = "EUR",
-        type = AccountTypeSavings
-      }
+      local type
 
-      if debug then
-        print("Fetched account:")
-        print("  Name:", account.name)
-        print("  Number:", account.accountNumber)
-        -- print("  BIC:", account.bic)
-        print("  IBAN:", account.iban)
-        print("  Currency:", account.currency)
-        print("  Type:", account.type)
+      if element:xpath("td[1]//span"):text() == "Tagesgeld" then
+        type = AccountTypeSavings
+      elseif element:xpath("td[1]//span"):text() == "Festgeld" then
+        type = AccountTypeFixedTermDeposit
       end
 
-      table.insert(accounts, account)
+      if type then
+        local accountPage = HTML(connection:get(element:xpath("td[1]/a"):attr("href")))
+        accountPage:xpath("//*[@id='PrincipalToCashAccountLinkForm:savingAccountList']/tbody/tr"):each(
+          function(index, element)
+            local account = {
+              name = element:xpath("td[1]//span"):text(),
+              iban = element:xpath("td[2]//span"):text(),
+              accountNumber = element:xpath("td[2]//span"):text(),
+              currency = "EUR",
+              type = type
+            }
+
+            if debug then
+              print("Fetched account:")
+              print("  Name:", account.name)
+              print("  Number:", account.accountNumber)
+              -- print("  BIC:", account.bic)
+              print("  IBAN:", account.iban)
+              print("  Currency:", account.currency)
+              print("  Type:", account.type)
+            end
+
+            table.insert(accounts, account)
+          end
+        )
+      end
     end
   )
-
-  -- Navigate to "Festgeld" and parse accounts
-  -- TODO
 
   return accounts
 end
@@ -105,45 +119,64 @@ function RefreshAccount(account, since)
     )
   )
 
-  -- TODO: select account
-  -- TODO: select since
+  -- Select account
+  local selectedAccount =
+    transactionPage:xpath("//*[@id='accountNumber']/optgroup/option[contains(text(), '" .. account.iban .. "')]")
+  transactionPage:xpath("//*[@id='accountNumber']"):select(selectedAccount:attr("value"))
 
   -- Get balance
-  local balanceStr = transactionPage:xpath("//*[@id='accountNumber']/optgroup/option"):text()
+  local balance = 0
+  local balanceStr = selectedAccount:text()
+
   local i, s = balanceStr:find(account.name)
   local e, j = balanceStr:find(account.currency)
-  balance = strToAmount(balanceStr:sub(s + 2, e - 2))
+  if s ~= nil and e ~= nil then
+    balance = strToAmount(balanceStr:sub(s + 2, e - 2))
+  end
 
-  -- Get transactions
+  if debug then
+    print("Balance: " .. balance)
+  end
+
+  -- Select since date
+  transactionPage:xpath("//*[@id='minimumDate']"):attr(
+    "value",
+    ignoreSince and "01-01-1970" or MM.localizeDate("dd-MM-yyyy", since)
+  )
+
+  -- Load transactions
   transactionPage:xpath("//*[@name='CW_TOKEN']"):attr("value", token)
-  transactionPage:xpath("//*[@id='minimumDate']"):attr("value", "01-01-2010")
   transactionPage = HTML(connection:request(transactionPage:xpath("//*[@id='btnNext']"):click()))
   transactionPage:xpath("//*[@id='AccountingMovementForm:summaryFiles']/tbody/tr"):each(
     function(index, element)
-      local transaction = {
-        bookingDate = strToDate(element:xpath("td[1]//span"):text()),
-        valueDate = strToDate(element:xpath("td[2]//span"):text()),
-        bookingText = element:xpath("td[3]//span"):text(),
-        name = element:xpath("td[4]//span"):text(),
-        amount = strToAmount(element:xpath("td[5]//span"):text()),
-        currency = "EUR",
-        booked = true
-      }
+      local bookingDate = strToDate(element:xpath("td[1]//span"):text())
 
-      if debug then
-        print("Transaction:")
-        print("  Booking Date:", transaction.bookingDate)
-        print("  Value Date:", transaction.valueDate)
-        print("  Amount:", transaction.amount)
-        print("  Currency:", transaction.currency)
-        print("  Booking Text:", transaction.bookingText)
-        print("  Purpose:", (transaction.purpose and transaction.purpose or "-"))
-        print("  Name:", (transaction.name and transaction.name or "-"))
-        print("  Bank Code:", (transaction.bankCode and transaction.bankCode or "-"))
-        print("  Account Number:", (transaction.accountNumber and transaction.accountNumber or "-"))
+      if bookingDate ~= nil and (ignoreSince or bookingDate >= since) then
+        local transaction = {
+          bookingDate = bookingDate,
+          valueDate = strToDate(element:xpath("td[2]//span"):text()),
+          bookingText = element:xpath("td[3]//span"):text(),
+          name = element:xpath("td[4]//span"):text(),
+          amount = strToAmount(element:xpath("td[5]//span"):text()),
+          currency = "EUR",
+          booked = true
+        }
+
+        if debug then
+          print("Transaction:")
+          print("  Booking Date:", transaction.bookingDate)
+          print("  Value Date:", transaction.valueDate)
+          print("  Amount:", transaction.amount)
+          print("  Currency:", transaction.currency)
+          print("  Booking Text:", transaction.bookingText)
+          print("  Purpose:", (transaction.purpose and transaction.purpose or "-"))
+          print("  Name:", (transaction.name and transaction.name or "-"))
+          print("  Bank Code:", (transaction.bankCode and transaction.bankCode or "-"))
+          print("  Account Number:", (transaction.accountNumber and transaction.accountNumber or "-"))
+        end
+
+        table.insert(transactions, transaction)
       end
-
-      table.insert(transactions, transaction)
     end
   )
   return {balance = balance, transactions = transactions}
